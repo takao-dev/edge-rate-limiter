@@ -8,6 +8,7 @@ export interface RateLimitEntry {
   lastRefillMs: number;
   windowStartMs: number;
   count: number;
+  blockedUntilMs?: number;
 }
 
 export interface RateLimiterStore {
@@ -17,7 +18,7 @@ export interface RateLimiterStore {
 }
 
 /**
- * Ultra-fast In-Memory sliding store with automatic garbage collection.
+ * Ultra-fast In-Memory sliding store with automatic garbage collection and penalty blocks.
  */
 export class MemoryRateLimiterStore implements RateLimiterStore {
   private readonly map = new Map<string, { entry: RateLimitEntry; expiresAt: number }>();

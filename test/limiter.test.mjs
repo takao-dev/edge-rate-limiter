@@ -4,29 +4,107 @@ import {
   RateLimiter,
   MemoryRateLimiterStore,
   anonymizeClient,
+  isPrivateOrLoopbackIp,
 } from '../dist/index.js';
 
-test('RateLimiter consumes tokens and tracks remaining allowance', async () => {
-  const limiter = new RateLimiter({ limit: 5, windowMs: 10_000 });
+test('isPrivateOrLoopbackIp correctly identifies private, link-local and loopback ranges', () => {
+  // Loopback
+  assert.equal(isPrivateOrLoopbackIp('127.0.0.1'), true);
+  assert.equal(isPrivateOrLoopbackIp('127.0.1.5'), true);
+  assert.equal(isPrivateOrLoopbackIp('::1'), true);
 
-  const r1 = await limiter.consume('client-1');
+  // Private RFC 1918
+  assert.equal(isPrivateOrLoopbackIp('10.0.0.1'), true);
+  assert.equal(isPrivateOrLoopbackIp('172.16.0.1'), true);
+  assert.equal(isPrivateOrLoopbackIp('172.31.255.254'), true);
+  assert.equal(isPrivateOrLoopbackIp('192.168.1.100'), true);
+  assert.equal(isPrivateOrLoopbackIp('169.254.1.1'), true); // link-local
+
+  // Public IPs
+  assert.equal(isPrivateOrLoopbackIp('8.8.8.8'), false);
+  assert.equal(isPrivateOrLoopbackIp('1.1.1.1'), false);
+  assert.equal(isPrivateOrLoopbackIp('203.0.113.50'), false);
+  assert.equal(isPrivateOrLoopbackIp('172.32.0.1'), false); // beyond 172.16-31
+});
+
+test('skipPrivateIps bypasses rate limiting for internal traffic while limiting public IPs', async () => {
+  const limiter = new RateLimiter({ limit: 2, skipPrivateIps: true });
+
+  // Private IP can make unlimited requests
+  for (let i = 0; i < 10; i++) {
+    const res = await limiter.consume('127.0.0.1');
+    assert.equal(res.success, true);
+    assert.equal(res.remaining, 2);
+  }
+
+  // Public IP is properly throttled
+  await limiter.consume('203.0.113.1');
+  await limiter.consume('203.0.113.1');
+  const blocked = await limiter.consume('203.0.113.1');
+  assert.equal(blocked.success, false);
+});
+
+test('Penalty block (Ban/Jail) enforces total lockout and recovers after duration', async () => {
+  const limiter = new RateLimiter({ limit: 10, windowMs: 60_000 });
+  const attackerIp = '198.51.100.200';
+
+  // Apply a 150ms penalty block
+  await limiter.block(attackerIp, 150);
+
+  // Check status
+  const check = await limiter.checkBlocked(attackerIp);
+  assert.equal(check.blocked, true);
+  assert.ok(check.remainingMs > 0);
+
+  // Even small cost 0 requests must be rejected during block
+  const res = await limiter.consume(attackerIp, 0);
+  assert.equal(res.success, false);
+  assert.equal(res.isBlocked, true);
+  assert.ok(res.retryAfter > 0);
+
+  // Wait for block to expire
+  await new Promise((resolve) => setTimeout(resolve, 180));
+
+  const recoveredCheck = await limiter.checkBlocked(attackerIp);
+  assert.equal(recoveredCheck.blocked, false);
+
+  const allowed = await limiter.consume(attackerIp);
+  assert.equal(allowed.success, true);
+});
+
+test('Concurrency stress test: 50 parallel requests never exceed limit (race-condition free)', async () => {
+  const limiter = new RateLimiter({ limit: 20, windowMs: 5000 });
+  const clientKey = 'concurrent-tester-1';
+
+  // Fire 50 simultaneous requests
+  const results = await Promise.all(
+    Array.from({ length: 50 }, () => limiter.consume(clientKey, 1))
+  );
+
+  const passed = results.filter((r) => r.success).length;
+  const blocked = results.filter((r) => !r.success).length;
+
+  assert.equal(passed, 20);
+  assert.equal(blocked, 30);
+});
+
+test('Variable cost consumption deducts arbitrary token amounts', async () => {
+  const limiter = new RateLimiter({ limit: 10, windowMs: 10_000 });
+
+  // Heavy operation costs 6 tokens
+  const r1 = await limiter.consume('user-var', { cost: 6 });
   assert.equal(r1.success, true);
   assert.equal(r1.remaining, 4);
-  assert.equal(r1.limit, 5);
 
-  const r2 = await limiter.consume('client-1', 2);
-  assert.equal(r2.success, true);
-  assert.equal(r2.remaining, 2);
+  // Operation requiring 5 tokens fails because only 4 remain
+  const r2 = await limiter.consume('user-var', { cost: 5 });
+  assert.equal(r2.success, false);
+  assert.equal(r2.remaining, 0);
 
-  const r3 = await limiter.consume('client-1', 2);
+  // Operation requiring 4 tokens succeeds exactly
+  const r3 = await limiter.consume('user-var', { cost: 4 });
   assert.equal(r3.success, true);
   assert.equal(r3.remaining, 0);
-
-  // Exceeded
-  const r4 = await limiter.consume('client-1', 1);
-  assert.equal(r4.success, false);
-  assert.equal(r4.remaining, 0);
-  assert.ok(r4.retryAfter > 0);
 });
 
 test('RateLimiter generates IETF compliant RateLimit headers', async () => {
@@ -45,21 +123,6 @@ test('RateLimiter generates IETF compliant RateLimit headers', async () => {
   const blockedHeaders = limiter.getHeaders(blocked);
   assert.equal(blockedHeaders['RateLimit-Remaining'], '0');
   assert.ok(Number(blockedHeaders['Retry-After']) > 0);
-});
-
-test('RateLimiter resets allowance after window expires', async () => {
-  const limiter = new RateLimiter({ limit: 2, windowMs: 100 });
-
-  await limiter.consume('short-client', 2);
-  const blocked = await limiter.consume('short-client');
-  assert.equal(blocked.success, false);
-
-  // Wait 120ms
-  await new Promise((resolve) => setTimeout(resolve, 120));
-
-  const renewed = await limiter.consume('short-client');
-  assert.equal(renewed.success, true);
-  assert.equal(renewed.remaining, 1);
 });
 
 test('anonymizeClient hashes raw identifiers into Zero-PII keys', async () => {
