@@ -11,6 +11,7 @@ import {
   MemoryRateLimiterStore,
   anonymizeClient,
   isPrivateOrLoopbackIp,
+  getWebCrypto,
 } from '../dist/index.js';
 
 test('isPrivateOrLoopbackIp correctly identifies private, link-local and loopback ranges', () => {
@@ -229,4 +230,16 @@ test('RateLimiter penalty checkBlocked and initial overload rejection', async ()
   assert.equal(overload.success, false);
   assert.equal(overload.remaining, 0);
   assert.ok(overload.retryAfter > 0);
+});
+
+test('getWebCrypto throws when subtle crypto is unavailable', () => {
+  const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  try {
+    Object.defineProperty(globalThis, 'crypto', { configurable: true, value: undefined });
+    assert.throws(() => getWebCrypto(), /WebCrypto SubtleCrypto is not available/i);
+  } finally {
+    if (originalCrypto) {
+      Object.defineProperty(globalThis, 'crypto', originalCrypto);
+    }
+  }
 });
