@@ -3,7 +3,12 @@
 Zero-dependency, high-performance sliding-window and token bucket rate limiter for Edge, Cloudflare Workers, and Node.js with native Zero-PII client anonymization.
 
 [![npm version](https://img.shields.io/npm/v/edge-rate-limiter.svg)](https://www.npmjs.com/package/edge-rate-limiter)
+[![CI](https://github.com/takao-dev/edge-rate-limiter/actions/workflows/ci.yml/badge.svg)](https://github.com/takao-dev/edge-rate-limiter/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/takao-dev/edge-rate-limiter/branch/main/graph/badge.svg)](https://codecov.io/gh/takao-dev/edge-rate-limiter)
+[![CodeQL](https://github.com/takao-dev/edge-rate-limiter/actions/workflows/codeql.yml/badge.svg)](https://github.com/takao-dev/edge-rate-limiter/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)]()
+[![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg)]()
 
 ---
 
