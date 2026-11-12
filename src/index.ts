@@ -7,7 +7,7 @@
 export * from './store.js';
 export * from './ip.js';
 
-import { RateLimiterStore, MemoryRateLimiterStore, RateLimitEntry } from './store.js';
+import { RateLimiterStore, MemoryRateLimiterStore } from './store.js';
 import { isPrivateOrLoopbackIp } from './ip.js';
 
 export interface RateLimiterOptions {
@@ -45,6 +45,22 @@ export interface RateLimitResult {
   isBlocked?: boolean;
 }
 
+function getWebCrypto(): Crypto {
+  if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle) {
+    return globalThis.crypto;
+  }
+  try {
+    const g = globalThis as any;
+    const nodeCrypto = g.crypto || (typeof g.process !== 'undefined' && g.process?.versions?.node ? (eval('require')('node:crypto') as any).webcrypto : undefined);
+    if (nodeCrypto?.subtle) {
+      return nodeCrypto as Crypto;
+    }
+  } catch {
+    // ignore
+  }
+  throw new Error('WebCrypto SubtleCrypto is not available in this environment');
+}
+
 /**
  * Anonymize an IP address or client identifier using salted SHA-256.
  * Ensures storage never holds raw IP addresses.
@@ -52,7 +68,8 @@ export interface RateLimitResult {
 export async function anonymizeClient(identifier: string, salt: string): Promise<string> {
   const encoder = new TextEncoder();
   const data = encoder.encode(`${salt}:${identifier}`);
-  const hash = await globalThis.crypto.subtle.digest('SHA-256', data);
+  const crypto = getWebCrypto();
+  const hash = await crypto.subtle.digest('SHA-256', data);
   const hex = Array.from(new Uint8Array(hash))
     .slice(0, 16)
     .map((b) => b.toString(16).padStart(2, '0'))
