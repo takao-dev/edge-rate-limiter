@@ -1,6 +1,6 @@
 {
   "name": "edge-rate-limiter",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Zero-dependency sliding-window and token bucket rate limiter for Edge, Cloudflare Workers, and Node.js with Zero-PII anonymization.",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -23,7 +23,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "pretest": "npm run build",
-    "test": "node --test test/*.test.mjs"
+    "pretest:coverage": "npm run build",
+    "test": "node --test test/*.test.mjs",
+    "prepack": "npm run build",
+    "test:coverage": "node -e \"require('node:fs').mkdirSync('coverage', {recursive: true})\" && node --test test/*.test.mjs --experimental-test-coverage --test-reporter=spec --test-reporter=lcov --test-reporter=junit --test-reporter-destination=stdout --test-reporter-destination=coverage/lcov.info --test-reporter-destination=coverage/junit.xml"
   },
   "keywords": [
     "rate-limit",
