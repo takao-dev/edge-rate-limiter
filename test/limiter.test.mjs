@@ -8,6 +8,7 @@ if (!globalThis.crypto || !globalThis.crypto.subtle) {
 
 import {
   RateLimiter,
+  MemoryRateLimiterStore,
   anonymizeClient,
   isPrivateOrLoopbackIp,
 } from '../dist/index.js';
@@ -155,4 +156,77 @@ test('RateLimiter isolates different clients', async () => {
   const bobAllowed = await limiter.consume('bob');
   assert.equal(bobAllowed.success, true);
   assert.equal(bobAllowed.remaining, 1);
+});
+
+test('MemoryRateLimiterStore lifecycle, eviction, size and TTL expiration', async () => {
+  const store = new MemoryRateLimiterStore(2); // capacity 2
+  assert.equal(store.size, 0);
+
+  const entry1 = { tokens: 5, lastRefillMs: Date.now(), windowStartMs: Date.now(), count: 1 };
+  store.set('k1', entry1, 1);
+  assert.equal(store.size, 1);
+  assert.equal(store.get('k1')?.tokens, 5);
+
+  // Expiration check
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.equal(store.get('k1'), null);
+  assert.equal(store.size, 0);
+
+  // Eviction check when maxEntries reached
+  store.set('a', entry1, 60);
+  store.set('b', entry1, 60);
+  assert.equal(store.size, 2);
+  store.set('c', entry1, 60); // triggers FIFO eviction of 'a'
+  assert.equal(store.get('a'), null);
+  assert.ok(store.get('b'));
+  assert.ok(store.get('c'));
+
+  // delete and clear
+  store.delete('b');
+  assert.equal(store.get('b'), null);
+  store.clear();
+  assert.equal(store.size, 0);
+});
+
+test('IP validator comprehensive boundary cases', () => {
+  // Empty and non-string inputs
+  assert.equal(isPrivateOrLoopbackIp(null), false);
+  assert.equal(isPrivateOrLoopbackIp(undefined), false);
+  assert.equal(isPrivateOrLoopbackIp(''), false);
+
+  // Malformed IPv4
+  assert.equal(isPrivateOrLoopbackIp('192.168.1'), false); // 3 parts
+  assert.equal(isPrivateOrLoopbackIp('192.168.1.1.1'), false); // 5 parts
+  assert.equal(isPrivateOrLoopbackIp('192.168.1.abc'), false); // NaN
+  assert.equal(isPrivateOrLoopbackIp('192.168.1.999'), false); // Out of range
+  assert.equal(isPrivateOrLoopbackIp('0.0.0.0'), true); // 0.0.0.0/8
+
+  // IPv6 boundary cases
+  assert.equal(isPrivateOrLoopbackIp('::'), true); // Unspecified
+  assert.equal(isPrivateOrLoopbackIp('fe80::1ff:fe23:4567:890a'), true); // Link-local
+  assert.equal(isPrivateOrLoopbackIp('fc00::1'), true); // Unique local
+  assert.equal(isPrivateOrLoopbackIp('fd12:3456:789a::1'), true); // Unique local
+  assert.equal(isPrivateOrLoopbackIp('2001:4860:4860::8888'), false); // Google DNS Public IPv6
+});
+
+test('RateLimiter penalty checkBlocked and initial overload rejection', async () => {
+  const limiter = new RateLimiter({ limit: 10, windowMs: 10_000, salt: 'test-salt' });
+
+  // Initial checkBlocked should be false
+  const unblocked = await limiter.checkBlocked('client_test');
+  assert.equal(unblocked.blocked, false);
+
+  // Block existing entry
+  await limiter.consume('client_test', 1);
+  await limiter.block('client_test', 5000);
+
+  const blocked = await limiter.checkBlocked('client_test');
+  assert.equal(blocked.blocked, true);
+  assert.ok(blocked.remainingMs > 0);
+
+  // Overload: request costing more than total limit fails immediately
+  const overload = await limiter.consume('overloaded_client', 100);
+  assert.equal(overload.success, false);
+  assert.equal(overload.remaining, 0);
+  assert.ok(overload.retryAfter > 0);
 });
