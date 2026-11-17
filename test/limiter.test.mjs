@@ -19,6 +19,11 @@ test('isPrivateOrLoopbackIp correctly identifies private, link-local and loopbac
   assert.equal(isPrivateOrLoopbackIp('127.0.0.1'), true);
   assert.equal(isPrivateOrLoopbackIp('127.0.1.5'), true);
   assert.equal(isPrivateOrLoopbackIp('::1'), true);
+  assert.equal(isPrivateOrLoopbackIp('::ffff:127.0.0.1'), true);
+  assert.equal(isPrivateOrLoopbackIp('fe90::1'), true);
+  assert.equal(isPrivateOrLoopbackIp('127x.0.0.1'), false);
+  assert.equal(isPrivateOrLoopbackIp('fcgarbage'), false);
+  assert.equal(isPrivateOrLoopbackIp('fdZZ::1'), false);
 
   // Private RFC 1918
   assert.equal(isPrivateOrLoopbackIp('10.0.0.1'), true);
@@ -64,7 +69,7 @@ test('Penalty block (Ban/Jail) enforces total lockout and recovers after duratio
   assert.ok(check.remainingMs > 0);
 
   // Even small cost 0 requests must be rejected during block
-  const res = await limiter.consume(attackerIp, 0);
+  const res = await limiter.consume(attackerIp, 1);
   assert.equal(res.success, false);
   assert.equal(res.isBlocked, true);
   assert.ok(res.retryAfter > 0);
@@ -133,7 +138,7 @@ test('RateLimiter generates IETF compliant RateLimit headers', async () => {
 });
 
 test('anonymizeClient hashes raw identifiers into Zero-PII keys', async () => {
-  const salt = 'daily-rotation-salt-20261111';
+  const salt = 'daily-rotation-salt-20261111-long-secret';
   const ip = '203.0.113.195';
 
   const anonKey = await anonymizeClient(ip, salt);
@@ -145,6 +150,12 @@ test('anonymizeClient hashes raw identifiers into Zero-PII keys', async () => {
 
   const otherKey = await anonymizeClient('198.51.100.22', salt);
   assert.notEqual(anonKey, otherKey);
+});
+
+test('anonymization rejects non-string and short secrets', async () => {
+  await assert.rejects(() => anonymizeClient('client', 'short'), /at least 32 UTF-8 bytes/);
+  assert.throws(() => new RateLimiter({ salt: 'short' }), /at least 32 UTF-8 bytes/);
+  assert.throws(() => new RateLimiter({ salt: 123 }), /at least 32 UTF-8 bytes/);
 });
 
 test('RateLimiter isolates different clients', async () => {
@@ -159,7 +170,7 @@ test('RateLimiter isolates different clients', async () => {
   assert.equal(bobAllowed.remaining, 1);
 });
 
-test('MemoryRateLimiterStore lifecycle, eviction, size and TTL expiration', async () => {
+test('MemoryRateLimiterStore preserves active quotas at capacity and expires entries', async () => {
   const store = new MemoryRateLimiterStore(2); // capacity 2
   assert.equal(store.size, 0);
 
@@ -173,14 +184,15 @@ test('MemoryRateLimiterStore lifecycle, eviction, size and TTL expiration', asyn
   assert.equal(store.get('k1'), null);
   assert.equal(store.size, 0);
 
-  // Eviction check when maxEntries reached
+  // Capacity never resets another active client's quota.
   store.set('a', entry1, 60);
   store.set('b', entry1, 60);
   assert.equal(store.size, 2);
-  store.set('c', entry1, 60); // triggers FIFO eviction of 'a'
-  assert.equal(store.get('a'), null);
+  assert.throws(() => store.set('c', entry1, 60), /capacity reached/i);
+  assert.ok(store.get('a'));
   assert.ok(store.get('b'));
-  assert.ok(store.get('c'));
+  store.set('a', { ...entry1, tokens: 2 }, 60);
+  assert.equal(store.get('a')?.tokens, 2);
 
   // delete and clear
   store.delete('b');
@@ -211,7 +223,7 @@ test('IP validator comprehensive boundary cases', () => {
 });
 
 test('RateLimiter penalty checkBlocked and initial overload rejection', async () => {
-  const limiter = new RateLimiter({ limit: 10, windowMs: 10_000, salt: 'test-salt' });
+  const limiter = new RateLimiter({ limit: 10, windowMs: 10_000, salt: 't'.repeat(32) });
 
   // Initial checkBlocked should be false
   const unblocked = await limiter.checkBlocked('client_test');
@@ -242,4 +254,29 @@ test('getWebCrypto throws when subtle crypto is unavailable', () => {
       Object.defineProperty(globalThis, 'crypto', originalCrypto);
     }
   }
+});
+
+test('shared stores serialize same-key operations across limiter instances', async () => {
+  const store = new MemoryRateLimiterStore();
+  const first = new RateLimiter({ limit: 10, windowMs: 5000, store });
+  const second = new RateLimiter({ limit: 10, windowMs: 5000, store });
+  const results = await Promise.all(Array.from({ length: 30 }, (_, index) => (index % 2 ? first : second).consume('shared-client')));
+  assert.equal(results.filter((result) => result.success).length, 10);
+});
+
+test('invalid costs and a full store fail closed without evicting a blocked client', async () => {
+  const store = new MemoryRateLimiterStore(1);
+  const limiter = new RateLimiter({ limit: 1, windowMs: 5000, store });
+  await assert.rejects(() => limiter.consume('first', -1), /positive finite numbers/i);
+  await assert.rejects(() => limiter.consume('first', 0), /positive finite numbers/i);
+  assert.equal((await limiter.consume('first')).success, true);
+  await assert.rejects(() => limiter.consume('second'), /capacity reached/i);
+  assert.equal((await limiter.consume('first')).success, false);
+});
+
+test('per-call limits cannot reuse allowance granted under a larger limit', async () => {
+  const limiter = new RateLimiter({ limit: 10, windowMs: 5000 });
+  assert.equal((await limiter.consume('changing-tier', { customLimit: 10 })).remaining, 9);
+  assert.equal((await limiter.consume('changing-tier', { customLimit: 2 })).remaining, 0);
+  assert.equal((await limiter.consume('changing-tier', { customLimit: 2 })).success, false);
 });

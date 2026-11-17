@@ -1,6 +1,6 @@
 /**
- * edge-rate-limiter: Zero-dependency token bucket and sliding-window rate limiter for Edge and Node.js.
- * Built with native WebCrypto for cryptographic Zero-PII client anonymization.
+ * edge-rate-limiter: Zero-dependency fixed-window rate limiter for Edge and Node.js.
+ * Built with native WebCrypto for optional keyed client pseudonyms.
  * Features: Auto penalty blocks, variable cost, private IP bypass, concurrency lock, IETF RateLimit headers.
  */
 
@@ -17,7 +17,7 @@ export interface RateLimiterOptions {
   windowMs?: number;
   /** Storage backend. Defaults to in-memory store. */
   store?: RateLimiterStore;
-  /** Optional salt to cryptographically anonymize client identifiers (Zero-PII). */
+  /** Optional secret of at least 32 UTF-8 bytes; when omitted, the raw client key is stored. */
   salt?: string;
   /** Automatically bypass rate limiting for private/loopback IP addresses. Defaults to false. */
   skipPrivateIps?: boolean;
@@ -53,19 +53,21 @@ export function getWebCrypto(): Crypto {
 }
 
 /**
- * Anonymize an IP address or client identifier using salted SHA-256.
- * Ensures storage never holds raw IP addresses.
+ * Derive a keyed pseudonym for an IP address or client identifier.
  */
 export async function anonymizeClient(identifier: string, salt: string): Promise<string> {
+  if (typeof identifier !== 'string' || typeof salt !== 'string' || new TextEncoder().encode(salt).byteLength < 32) {
+    throw new Error('Anonymization requires a client identifier and a secret of at least 32 UTF-8 bytes');
+  }
   const encoder = new TextEncoder();
-  const data = encoder.encode(`${salt}:${identifier}`);
   const crypto = getWebCrypto();
-  const hash = await crypto.subtle.digest('SHA-256', data);
+  const key = await crypto.subtle.importKey('raw', encoder.encode(salt), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const hash = await crypto.subtle.sign('HMAC', key, encoder.encode(`edge-rate-limiter:client:v2\0${identifier}`));
   const hex = Array.from(new Uint8Array(hash))
     .slice(0, 16)
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
-  return `rl_anon_${hex}`;
+  return `rl_anon_v2_${hex}`;
 }
 
 export class RateLimiter {
@@ -74,12 +76,18 @@ export class RateLimiter {
   private readonly store: RateLimiterStore;
   private readonly salt?: string;
   private readonly skipPrivateIps: boolean;
-  private readonly locks = new Map<string, Promise<void>>();
+  private readonly locks: Map<string, Promise<void>>;
 
   constructor(options: RateLimiterOptions = {}) {
     this.limit = options.limit ?? 60;
     this.windowMs = options.windowMs ?? 60_000;
+    if (!Number.isFinite(this.limit) || this.limit <= 0) throw new Error('limit must be positive and finite');
+    if (!Number.isFinite(this.windowMs) || this.windowMs <= 0) throw new Error('windowMs must be positive and finite');
     this.store = options.store ?? new MemoryRateLimiterStore();
+    this.locks = getStoreLocks(this.store);
+    if (options.salt !== undefined && (typeof options.salt !== 'string' || new TextEncoder().encode(options.salt).byteLength < 32)) {
+      throw new Error('salt must be a secret of at least 32 UTF-8 bytes');
+    }
     this.salt = options.salt;
     this.skipPrivateIps = Boolean(options.skipPrivateIps);
   }
@@ -103,6 +111,7 @@ export class RateLimiter {
    * Check if a client key is currently under a penalty block.
    */
   async checkBlocked(rawKey: string): Promise<{ blocked: boolean; remainingMs: number }> {
+    if (typeof rawKey !== 'string' || rawKey.length === 0) throw new Error('Client key must be a non-empty string');
     const key = this.salt ? await anonymizeClient(rawKey, this.salt) : rawKey;
     const release = await this.acquireLock(key);
     try {
@@ -126,6 +135,8 @@ export class RateLimiter {
    * Apply a penalty block (ban) to a client for a specified duration in milliseconds.
    */
   async block(rawKey: string, durationMs: number): Promise<void> {
+    if (typeof rawKey !== 'string' || rawKey.length === 0) throw new Error('Client key must be a non-empty string');
+    if (!Number.isFinite(durationMs) || durationMs <= 0) throw new Error('Block duration must be positive and finite');
     const key = this.salt ? await anonymizeClient(rawKey, this.salt) : rawKey;
     const release = await this.acquireLock(key);
     try {
@@ -157,6 +168,10 @@ export class RateLimiter {
    * Consume quota for a given client key.
    */
   async consume(rawKey: string, optionsOrCost: number | ConsumeOptions = 1): Promise<RateLimitResult> {
+    if (typeof rawKey !== 'string' || rawKey.length === 0) throw new Error('Client key must be a non-empty string');
+    if (optionsOrCost === null || (typeof optionsOrCost !== 'number' && typeof optionsOrCost !== 'object')) {
+      throw new Error('Consume options must be a positive cost or options object');
+    }
     // Check private IP bypass if enabled
     if (this.skipPrivateIps && isPrivateOrLoopbackIp(rawKey)) {
       return {
@@ -172,6 +187,9 @@ export class RateLimiter {
     const activeLimit = typeof optionsOrCost === 'object' && typeof optionsOrCost.customLimit === 'number'
       ? optionsOrCost.customLimit
       : this.limit;
+    if (!Number.isFinite(cost) || cost <= 0 || !Number.isFinite(activeLimit) || activeLimit <= 0) {
+      throw new Error('Rate limit and cost must be positive finite numbers');
+    }
 
     const key = this.salt ? await anonymizeClient(rawKey, this.salt) : rawKey;
     const release = await this.acquireLock(key);
@@ -198,6 +216,7 @@ export class RateLimiter {
           // Block expired; recover tokens and start fresh window
           delete entry.blockedUntilMs;
           entry.tokens = activeLimit;
+          entry.count = 0;
           entry.windowStartMs = now;
         }
       }
@@ -228,8 +247,9 @@ export class RateLimiter {
       const elapsed = now - entry.windowStartMs;
       const remainingTimeMs = Math.max(0, this.windowMs - elapsed);
       const retryAfterSec = Math.max(1, Math.ceil(remainingTimeMs / 1000));
+      const remainingAllowance = Math.max(0, Math.min(entry.tokens, activeLimit - entry.count));
 
-      if (entry.tokens < cost) {
+      if (remainingAllowance < cost) {
         return {
           success: false,
           limit: activeLimit,
@@ -239,7 +259,7 @@ export class RateLimiter {
         };
       }
 
-      entry.tokens -= cost;
+      entry.tokens = remainingAllowance - cost;
       entry.count += cost;
       await this.store.set(key, entry, retryAfterSec);
 
@@ -271,4 +291,11 @@ export class RateLimiter {
 
     return headers;
   }
+}
+
+const storeLocks = new WeakMap<RateLimiterStore, Map<string, Promise<void>>>();
+function getStoreLocks(store: RateLimiterStore): Map<string, Promise<void>> {
+  let locks = storeLocks.get(store);
+  if (!locks) { locks = new Map(); storeLocks.set(store, locks); }
+  return locks;
 }

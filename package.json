@@ -41,6 +41,14 @@
   ],
   "author": "takao-dev",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/takao-dev/edge-rate-limiter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/takao-dev/edge-rate-limiter/issues"
+  },
+  "homepage": "https://github.com/takao-dev/edge-rate-limiter#readme",
   "engines": {
     "node": ">=18.0.0"
   },
