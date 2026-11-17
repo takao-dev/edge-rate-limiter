@@ -267,6 +267,7 @@ test('shared stores serialize same-key operations across limiter instances', asy
 test('invalid costs and a full store fail closed without evicting a blocked client', async () => {
   const store = new MemoryRateLimiterStore(1);
   const limiter = new RateLimiter({ limit: 1, windowMs: 5000, store });
+  await assert.rejects(() => limiter.consume('first', null), /positive cost or options object/i);
   await assert.rejects(() => limiter.consume('first', -1), /positive finite numbers/i);
   await assert.rejects(() => limiter.consume('first', 0), /positive finite numbers/i);
   assert.equal((await limiter.consume('first')).success, true);
